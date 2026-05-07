@@ -9,10 +9,15 @@ app = Flask(__name__)
 
 TRONGRID_BASE = "https://api.trongrid.io"
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+# Neutral owner address for constant calls
+NEUTRAL_ADDR = "TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax"
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    })
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
@@ -21,25 +26,117 @@ def post_json(url, payload):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        },
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
-def base58_to_hex(address):
-    """Convert Tron base58check address to 20-byte hex (without 41 prefix)."""
-    decoded = base58.b58decode_check(address)  # 21 bytes: 0x41 + 20 bytes
-    return decoded[1:].hex()  # strip leading 0x41
-
-
 def validate_address(address):
+    """Validate Tron base58check address."""
     try:
         decoded = base58.b58decode_check(address)
         return len(decoded) == 21 and decoded[0] == 0x41
     except Exception:
         return False
+
+
+def base58_to_param(address):
+    """Convert Tron base58 address to 32-byte ABI-encoded hex parameter."""
+    decoded = base58.b58decode_check(address)  # 21 bytes: 0x41 + 20 bytes
+    addr_20 = decoded[1:]  # 20 bytes
+    return addr_20.hex().zfill(64)  # left-pad to 32 bytes = 64 hex chars
+
+
+def is_blacklisted_contract(address):
+    """
+    Primary method: call isBlacklisted(address) on USDT contract.
+    Returns True/False/None (None = call failed).
+    """
+    try:
+        param = base58_to_param(address)
+        url = "{}/wallet/triggerconstantcontract".format(TRONGRID_BASE)
+        payload = {
+            "owner_address": NEUTRAL_ADDR,
+            "contract_address": USDT_CONTRACT,
+            "function_selector": "isBlacklisted(address)",
+            "parameter": param,
+            "call_value": 0,
+            "fee_limit": 1000000,
+            "visible": True
+        }
+        result = post_json(url, payload)
+
+        # Check for contract execution error
+        if not result.get("result", {}).get("result", True) is False:
+            constant = result.get("constant_result", [])
+            if constant and len(constant) > 0:
+                hex_val = constant[0].strip()
+                if len(hex_val) == 64:
+                    return int(hex_val, 16) != 0
+        return None
+    except Exception:
+        return None
+
+
+def is_blacklisted_events(address):
+    """
+    Fallback method: check AddedBlackList/RemovedBlackList events on TronGrid.
+    Returns True/False/None.
+    """
+    try:
+        url = (
+            "{}/v1/contracts/{}/events"
+            "?event_name=AddedBlackList&only_confirmed=true&limit=200"
+        ).format(TRONGRID_BASE, USDT_CONTRACT)
+
+        data = fetch(url)
+        events = data.get("data", [])
+
+        added = set()
+        removed = set()
+
+        for ev in events:
+            result_data = ev.get("result", {})
+            user = result_data.get("_user") or result_data.get("user") or result_data.get("0")
+            if user:
+                added.add(user.lower())
+
+        # Check RemovedBlackList
+        url2 = (
+            "{}/v1/contracts/{}/events"
+            "?event_name=RemovedBlackList&only_confirmed=true&limit=200"
+        ).format(TRONGRID_BASE, USDT_CONTRACT)
+        data2 = fetch(url2)
+        for ev in data2.get("data", []):
+            result_data = ev.get("result", {})
+            user = result_data.get("_user") or result_data.get("user") or result_data.get("0")
+            if user:
+                removed.add(user.lower())
+
+        addr_lower = address.lower()
+        if addr_lower in added and addr_lower not in removed:
+            return True
+        if addr_lower in added:
+            return True  # conservative: if ever added, flag it
+        return False
+    except Exception:
+        return None
+
+
+def is_blacklisted(address):
+    """Try contract call first, fall back to events."""
+    result = is_blacklisted_contract(address)
+    if result is not None:
+        return result
+    # Fallback
+    result = is_blacklisted_events(address)
+    return result if result is not None else False
 
 
 def get_usdt_balance(address):
@@ -56,37 +153,6 @@ def get_usdt_balance(address):
         return 0.0
     except Exception:
         return 0.0
-
-
-def is_blacklisted(address):
-    """
-    Call isBlacklisted(address) on USDT TRC20 contract via triggerconstantcontract.
-    ABI-encode the address: 20-byte hex padded to 32 bytes (64 hex chars).
-    Use visible=true so we can pass base58 addresses directly.
-    """
-    try:
-        addr_hex_20 = base58_to_hex(address)
-        param = addr_hex_20.zfill(64)  # pad to 32 bytes
-
-        url = "{}/wallet/triggerconstantcontract".format(TRONGRID_BASE)
-        payload = {
-            "owner_address": "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",  # zero-like neutral address
-            "contract_address": USDT_CONTRACT,
-            "function_selector": "isBlacklisted(address)",
-            "parameter": param,
-            "call_value": 0,
-            "fee_limit": 1000000,
-            "visible": True
-        }
-        result = post_json(url, payload)
-
-        constant_result = result.get("constant_result", [])
-        if constant_result:
-            hex_val = constant_result[0].strip()
-            return int(hex_val, 16) == 1
-        return False
-    except Exception:
-        return False
 
 
 @app.route("/")
