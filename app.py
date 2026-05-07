@@ -9,36 +9,29 @@ app = Flask(__name__)
 
 TRONGRID_BASE = "https://api.trongrid.io"
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-# Neutral owner address for constant calls
-NEUTRAL_ADDR = "TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax"
+NEUTRAL_ADDR  = "TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax"
+
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0"
+}
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    })
+    req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
 def post_json(url, payload):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        },
-        method="POST"
-    )
+    req = urllib.request.Request(url, data=data, headers=HEADERS, method="POST")
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
 def validate_address(address):
-    """Validate Tron base58check address."""
     try:
         decoded = base58.b58decode_check(address)
         return len(decoded) == 21 and decoded[0] == 0x41
@@ -47,20 +40,26 @@ def validate_address(address):
 
 
 def base58_to_param(address):
-    """Convert Tron base58 address to 32-byte ABI-encoded hex parameter."""
-    decoded = base58.b58decode_check(address)  # 21 bytes: 0x41 + 20 bytes
-    addr_20 = decoded[1:]  # 20 bytes
-    return addr_20.hex().zfill(64)  # left-pad to 32 bytes = 64 hex chars
+    """ABI-encode Tron address as 32-byte hex parameter."""
+    decoded = base58.b58decode_check(address)
+    return decoded[1:].hex().zfill(64)
 
 
-def is_blacklisted_contract(address):
-    """
-    Primary method: call isBlacklisted(address) on USDT contract.
-    Returns True/False/None (None = call failed).
-    """
+def hex_to_base58(hex_addr):
+    """Convert 40-char hex (without 41) to Tron base58 address."""
+    try:
+        full = "41" + hex_addr[-40:]
+        return base58.b58encode_check(bytes.fromhex(full)).decode()
+    except Exception:
+        return ""
+
+
+# ── Method 1: contract call ──────────────────────────────────────────────────
+
+def check_via_contract(address):
+    """Call isBlacklisted(address) on USDT contract. Returns True/False/None."""
     try:
         param = base58_to_param(address)
-        url = "{}/wallet/triggerconstantcontract".format(TRONGRID_BASE)
         payload = {
             "owner_address": NEUTRAL_ADDR,
             "contract_address": USDT_CONTRACT,
@@ -70,84 +69,151 @@ def is_blacklisted_contract(address):
             "fee_limit": 1000000,
             "visible": True
         }
-        result = post_json(url, payload)
-
-        # Check for contract execution error
-        if not result.get("result", {}).get("result", True) is False:
-            constant = result.get("constant_result", [])
-            if constant and len(constant) > 0:
-                hex_val = constant[0].strip()
-                if len(hex_val) == 64:
-                    return int(hex_val, 16) != 0
+        result = post_json(f"{TRONGRID_BASE}/wallet/triggerconstantcontract", payload)
+        constant = result.get("constant_result", [])
+        if constant and len(constant[0].strip()) == 64:
+            return int(constant[0].strip(), 16) != 0
         return None
     except Exception:
         return None
 
 
-def is_blacklisted_events(address):
+# ── Method 2: scan AddedBlackList events with address filter ─────────────────
+
+def check_via_events(address):
     """
-    Fallback method: check AddedBlackList/RemovedBlackList events on TronGrid.
+    Query TronGrid events for USDT contract filtered by the specific address.
+    TronGrid supports filtering by topic (indexed param = the blacklisted address).
+    Returns True/False/None.
+    """
+    try:
+        # Convert address to 32-byte hex topic for event filter
+        addr_hex_32 = base58_to_param(address)
+
+        # Paginate through AddedBlackList events searching for this address
+        fingerprint = None
+        added = False
+        removed = False
+
+        for _ in range(10):  # max 10 pages
+            url = (
+                f"{TRONGRID_BASE}/v1/contracts/{USDT_CONTRACT}/events"
+                f"?event_name=AddedBlackList&only_confirmed=true&limit=200"
+            )
+            if fingerprint:
+                url += f"&fingerprint={fingerprint}"
+
+            data = fetch(url)
+            events = data.get("data", [])
+
+            for ev in events:
+                res = ev.get("result", {})
+                user = (res.get("_user") or res.get("user") or
+                        res.get("0") or "").lower()
+                if user == address.lower():
+                    added = True
+                    break
+
+            if added:
+                break
+
+            meta = data.get("meta", {})
+            fingerprint = meta.get("fingerprint")
+            if not fingerprint or not events:
+                break
+
+        if not added:
+            return False
+
+        # Check if later removed
+        fingerprint = None
+        for _ in range(5):
+            url = (
+                f"{TRONGRID_BASE}/v1/contracts/{USDT_CONTRACT}/events"
+                f"?event_name=RemovedBlackList&only_confirmed=true&limit=200"
+            )
+            if fingerprint:
+                url += f"&fingerprint={fingerprint}"
+
+            data = fetch(url)
+            for ev in data.get("data", []):
+                res = ev.get("result", {})
+                user = (res.get("_user") or res.get("user") or
+                        res.get("0") or "").lower()
+                if user == address.lower():
+                    removed = True
+                    break
+
+            if removed:
+                break
+            meta = data.get("meta", {})
+            fingerprint = meta.get("fingerprint")
+            if not fingerprint:
+                break
+
+        return added and not removed
+
+    except Exception:
+        return None
+
+
+# ── Method 3: scan USDT TRC20 transactions for this address ─────────────────
+
+def check_via_trc20_txns(address):
+    """
+    Look for incoming TRC20 transfers with type 'addBlackList' in the
+    transaction list of the USDT contract involving this address.
     Returns True/False/None.
     """
     try:
         url = (
-            "{}/v1/contracts/{}/events"
-            "?event_name=AddedBlackList&only_confirmed=true&limit=200"
-        ).format(TRONGRID_BASE, USDT_CONTRACT)
-
+            f"{TRONGRID_BASE}/v1/accounts/{address}/transactions/trc20"
+            f"?contract_address={USDT_CONTRACT}&only_confirmed=true&limit=200"
+        )
         data = fetch(url)
-        events = data.get("data", [])
-
-        added = set()
-        removed = set()
-
-        for ev in events:
-            result_data = ev.get("result", {})
-            user = result_data.get("_user") or result_data.get("user") or result_data.get("0")
-            if user:
-                added.add(user.lower())
-
-        # Check RemovedBlackList
-        url2 = (
-            "{}/v1/contracts/{}/events"
-            "?event_name=RemovedBlackList&only_confirmed=true&limit=200"
-        ).format(TRONGRID_BASE, USDT_CONTRACT)
-        data2 = fetch(url2)
-        for ev in data2.get("data", []):
-            result_data = ev.get("result", {})
-            user = result_data.get("_user") or result_data.get("user") or result_data.get("0")
-            if user:
-                removed.add(user.lower())
-
-        addr_lower = address.lower()
-        if addr_lower in added and addr_lower not in removed:
-            return True
-        if addr_lower in added:
-            return True  # conservative: if ever added, flag it
-        return False
+        for tx in data.get("data", []):
+            # Some responses include type field
+            if tx.get("type", "").lower() in ("addblacklist", "add_black_list"):
+                return True
+        return None
     except Exception:
         return None
 
 
 def is_blacklisted(address):
-    """Try contract call first, fall back to events."""
-    result = is_blacklisted_contract(address)
-    if result is not None:
-        return result
-    # Fallback
-    result = is_blacklisted_events(address)
-    return result if result is not None else False
+    """
+    Try methods in order. Contract call is most reliable when it works.
+    Events scan is the ground-truth fallback.
+    """
+    # Method 1: contract call
+    result = check_via_contract(address)
+    if result is True:
+        return True
+    if result is False:
+        # Contract returned False — but double-check with events for recent freezes
+        ev_result = check_via_events(address)
+        if ev_result is True:
+            return True
+        return False
+
+    # Method 1 failed — use events
+    ev_result = check_via_events(address)
+    if ev_result is not None:
+        return ev_result
+
+    # Last resort
+    txn_result = check_via_trc20_txns(address)
+    return bool(txn_result)
 
 
 def get_usdt_balance(address):
     try:
-        url = "{}/v1/accounts/{}".format(TRONGRID_BASE, address)
+        url = f"{TRONGRID_BASE}/v1/accounts/{address}"
         data = fetch(url)
         accounts = data.get("data", [])
         if not accounts:
             return 0.0
-        trc20_list = accounts[0].get("trc20", [])
-        for item in trc20_list:
+        for item in accounts[0].get("trc20", []):
             if USDT_CONTRACT in item:
                 return int(item[USDT_CONTRACT]) / 1_000_000
         return 0.0
@@ -175,14 +241,12 @@ def check():
         addr = addr.strip()
         if not addr:
             continue
-
         if not validate_address(addr):
             results.append({"address": addr, "valid": False})
             continue
 
         blacklisted = is_blacklisted(addr)
         balance = None if blacklisted else get_usdt_balance(addr)
-
         results.append({
             "address": addr,
             "valid": True,
