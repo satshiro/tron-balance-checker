@@ -1,5 +1,6 @@
 import os
 import json
+import base58
 import urllib.request
 import urllib.error
 from flask import Flask, render_template, jsonify, request
@@ -27,11 +28,16 @@ def post_json(url, payload):
         return json.loads(resp.read().decode())
 
 
+def base58_to_hex(address):
+    """Convert Tron base58check address to 20-byte hex (without 41 prefix)."""
+    decoded = base58.b58decode_check(address)  # 21 bytes: 0x41 + 20 bytes
+    return decoded[1:].hex()  # strip leading 0x41
+
+
 def validate_address(address):
     try:
-        url = "{}/wallet/validateaddress".format(TRONGRID_BASE)
-        result = post_json(url, {"address": address})
-        return result.get("result", False)
+        decoded = base58.b58decode_check(address)
+        return len(decoded) == 21 and decoded[0] == 0x41
     except Exception:
         return False
 
@@ -53,25 +59,27 @@ def get_usdt_balance(address):
 
 
 def is_blacklisted(address):
+    """
+    Call isBlacklisted(address) on USDT TRC20 contract via triggerconstantcontract.
+    ABI-encode the address: 20-byte hex padded to 32 bytes (64 hex chars).
+    Use visible=true so we can pass base58 addresses directly.
+    """
     try:
-        val_url = "{}/wallet/validateaddress".format(TRONGRID_BASE)
-        val = post_json(val_url, {"address": address})
-        if not val.get("result"):
-            return False
-
-        addr_hex = val.get("extra", {}).get("address_hex", "")
-        param = addr_hex[2:].zfill(64) if addr_hex.startswith("41") else addr_hex.zfill(64)
+        addr_hex_20 = base58_to_hex(address)
+        param = addr_hex_20.zfill(64)  # pad to 32 bytes
 
         url = "{}/wallet/triggerconstantcontract".format(TRONGRID_BASE)
         payload = {
-            "owner_address": address,
+            "owner_address": "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",  # zero-like neutral address
             "contract_address": USDT_CONTRACT,
             "function_selector": "isBlacklisted(address)",
             "parameter": param,
             "call_value": 0,
-            "fee_limit": 1000000
+            "fee_limit": 1000000,
+            "visible": True
         }
         result = post_json(url, payload)
+
         constant_result = result.get("constant_result", [])
         if constant_result:
             hex_val = constant_result[0].strip()
