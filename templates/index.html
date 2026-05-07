@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -229,7 +228,7 @@
       return;
     }
 
-    const addresses = raw.split('\n').map(a => a.trim()).filter(Boolean);
+    const addresses = raw.split(/[\n,;\s]+/).map(a => a.trim()).filter(Boolean);
     if (addresses.length > 20) {
       out.innerHTML = `<div class="error-box">Massimo 20 indirizzi per volta.</div>`;
       return;
@@ -272,7 +271,7 @@
           </div>
           <div class="summary-item">
             <div class="num" style="color:#4caf50">${clean}</div>
-            <div class="lbl">Puliti</div>
+            <div class="lbl">Not Blacklisted</div>
           </div>
           <div class="summary-item">
             <div class="num" style="color:#fff;font-size:16px">${fmtBalance(totalUsdt)}</div>
@@ -315,7 +314,7 @@
                 </div>
               </div>
               <div class="card-right">
-                <span class="badge badge-clean">✓ Pulito</span>
+                <span class="badge badge-clean">✓ Not Blacklisted</span>
                 <div class="balance">${fmtBalance(r.balance)}<span>USDT</span></div>
               </div>
             </div>`;
